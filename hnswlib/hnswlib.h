@@ -131,6 +131,8 @@ static bool AVX512Capable() {
 #include <string.h>
 #include <stdlib.h>
 
+#include "index_compat.h"
+
 #if defined(__EXCEPTIONS) || _HAS_EXCEPTIONS == 1
 #define HNSWLIB_THROW_RUNTIME_ERROR(message) throw std::runtime_error(message)
 #else
@@ -158,7 +160,24 @@ public:
     Status() : message_(nullptr) {}
 
     // Constructor with an error message (nullptr is interpreted as OK status).
-    Status(const char* message) : message_(message) {}
+    Status(const char* message)
+        : storage_(message ? message : ""),
+          message_(message ? storage_.c_str() : nullptr) {}
+
+    Status(const std::string& message)
+        : storage_(message), message_(storage_.c_str()) {}
+
+    Status(const Status& other)
+        : storage_(other.storage_),
+          message_(other.message_ ? storage_.c_str() : nullptr) {}
+
+    Status& operator=(const Status& other) {
+        if (this != &other) {
+            storage_ = other.storage_;
+            message_ = other.message_ ? storage_.c_str() : nullptr;
+        }
+        return *this;
+    }
 
     // Returns true if the status is OK.
     bool ok() const { return !message_; }
@@ -168,6 +187,7 @@ public:
 
 private:
     // nullptr if OK, a message otherwise.
+    std::string storage_;
     const char* message_;
 };
 
@@ -358,6 +378,10 @@ class SpaceInterface {
     virtual DISTFUNC<MTYPE> get_dist_func() = 0;
 
     virtual void *get_dist_func_param() = 0;
+
+    virtual uint32_t get_space_id() const {
+        return INDEX_SPACE_UNKNOWN;
+    }
 
     virtual ~SpaceInterface() {}
 };

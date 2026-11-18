@@ -202,6 +202,7 @@ class Index {
         }
         cur_l = 0;
         appr_alg = new hnswlib::HierarchicalNSW<dist_t>(l2space, maxElements, M, efConstruction, random_seed, allow_replace_deleted);
+        appr_alg->setCompatibilitySpaceId(hnswlib::spaceIdFromName(space_name));
         index_inited = true;
         ep_added = false;
         appr_alg->ef_ = default_ef;
@@ -229,14 +230,39 @@ class Index {
     }
 
 
-    void loadIndex(const std::string &path_to_index, size_t max_elements, bool allow_replace_deleted) {
+    void loadIndex(const std::string &path_to_index, size_t max_elements,
+                   bool allow_replace_deleted,
+                   bool check_compatibility = true) {
+      if (check_compatibility) {
+          hnswlib::IndexCompatibilityReport report =
+              hnswlib::inspectIndexFile(path_to_index, space_name, dim);
+          if (!report.loadable) {
+              HNSWLIB_THROW_RUNTIME_ERROR(
+                  ("Index compatibility check failed: " + report.reason).c_str());
+          }
+          if (report.legacy) {
+              for (size_t i = 0; i < report.warnings.size(); ++i)
+                  std::cerr << "hnswlib compatibility warning: "
+                            << report.warnings[i] << std::endl;
+          }
+      }
       if (appr_alg) {
           std::cerr << "Warning: Calling load_index for an already inited index. Old index is being deallocated." << std::endl;
           delete appr_alg;
+          appr_alg = nullptr;
       }
-      appr_alg = new hnswlib::HierarchicalNSW<dist_t>(l2space, path_to_index, false, max_elements, allow_replace_deleted);
+      appr_alg = new hnswlib::HierarchicalNSW<dist_t>(
+          l2space, path_to_index, false, max_elements, allow_replace_deleted,
+          check_compatibility);
+      appr_alg->setCompatibilitySpaceId(hnswlib::spaceIdFromName(space_name));
       cur_l = appr_alg->cur_element_count;
       index_inited = true;
+    }
+
+    std::vector<std::string> getCompatibilityWarnings() const {
+        if (!appr_alg)
+            return std::vector<std::string>();
+        return appr_alg->getCompatibilityWarnings();
     }
 
 
@@ -505,6 +531,8 @@ class Index {
                 d["M"].cast<size_t>(),
                 d["ef_construction"].cast<size_t>(),
                 new_index->seed);
+            new_index->appr_alg->setCompatibilitySpaceId(
+                hnswlib::spaceIdFromName(space_name_));
             new_index->cur_l = d["cur_element_count"].cast<size_t>();
         }
 
@@ -931,9 +959,133 @@ class BFIndex {
     }
 };
 
+py::dict compatibilityMetadataToDict(
+    const hnswlib::IndexFormatMetadata &metadata) {
+    return py::dict(
+        "present"_a = metadata.present,
+        "metadata_version"_a = metadata.metadata_version,
+        "format_version"_a = metadata.format_version,
+        "min_reader_version"_a = metadata.min_reader_version,
+        "byte_order"_a = hnswlib::byteOrderName(metadata.body_byte_order),
+        "byte_order_id"_a = metadata.body_byte_order,
+        "size_t_size"_a = metadata.size_t_size,
+        "pointer_size"_a = metadata.pointer_size,
+        "max_align"_a = metadata.max_align,
+        "space"_a = hnswlib::spaceName(metadata.space_id),
+        "dim"_a = metadata.dim,
+        "distance_type_size"_a = metadata.distance_type_size,
+        "max_elements"_a = metadata.max_elements,
+        "element_count"_a = metadata.element_count,
+        "M"_a = metadata.graph_m,
+        "ef_construction"_a = metadata.ef_construction,
+        "header_offset"_a = metadata.header_offset,
+        "header_size"_a = metadata.header_size,
+        "body_size"_a = metadata.body_size,
+        "file_size"_a = metadata.file_size,
+        "size_data_per_element"_a = metadata.size_data_per_element,
+        "offset_data"_a = metadata.offset_data,
+        "label_offset"_a = metadata.label_offset,
+        "data_alignment"_a = metadata.data_alignment,
+        "data_size"_a = metadata.data_size);
+}
+
+py::dict compatibilityReportToDict(
+    const hnswlib::IndexCompatibilityReport &report) {
+    py::list warnings;
+    for (size_t i = 0; i < report.warnings.size(); ++i)
+        warnings.append(report.warnings[i]);
+    return py::dict(
+        "path"_a = report.path,
+        "status"_a = report.status,
+        "reason"_a = report.reason,
+        "readable"_a = report.readable,
+        "loadable"_a = report.loadable,
+        "upgradeable"_a = report.upgradeable,
+        "requires_rebuild"_a = report.requires_rebuild,
+        "legacy"_a = report.legacy,
+        "truncated"_a = report.truncated,
+        "endian_mismatch"_a = report.endian_mismatch,
+        "layout_mismatch"_a = report.layout_mismatch,
+        "parameter_conflict"_a = report.parameter_conflict,
+        "warnings"_a = warnings,
+        "metadata"_a = compatibilityMetadataToDict(report.metadata));
+}
+
+py::dict inspectIndexFile(const std::string &path,
+                          const std::string &expected_space,
+                          uint32_t expected_dim,
+                          uint64_t expected_m,
+                          uint64_t expected_ef_construction,
+                          uint32_t reader_version) {
+    hnswlib::IndexCompatibilityReport report;
+    if (reader_version == 0) {
+        report = hnswlib::inspectIndexFile(
+            path, expected_space, expected_dim, expected_m,
+            expected_ef_construction);
+    } else {
+        report = hnswlib::inspectIndexFile(
+            path, expected_space, expected_dim, expected_m,
+            expected_ef_construction, reader_version);
+    }
+    return compatibilityReportToDict(report);
+}
+
+py::dict scanIndexFiles(const std::vector<std::string> &paths,
+                        const std::string &expected_space,
+                        uint32_t expected_dim,
+                        uint64_t expected_m,
+                        uint64_t expected_ef_construction,
+                        uint32_t reader_version) {
+    py::list compatible;
+    py::list upgradeable;
+    py::list rebuild_required;
+    for (size_t i = 0; i < paths.size(); ++i) {
+        const std::string &path = paths[i];
+        hnswlib::IndexCompatibilityReport report;
+        if (reader_version == 0) {
+            report = hnswlib::inspectIndexFile(
+                path, expected_space, expected_dim, expected_m,
+                expected_ef_construction);
+        } else {
+            report = hnswlib::inspectIndexFile(
+                path, expected_space, expected_dim, expected_m,
+                expected_ef_construction, reader_version);
+        }
+        py::dict item = compatibilityReportToDict(report);
+        item["action"] =
+            report.loadable
+                ? (report.legacy ? "rewrite_metadata" : "use_as_is")
+                : "rebuild";
+        if (!report.loadable) {
+            rebuild_required.append(item);
+            item["category"] = "rebuild_required";
+        } else {
+            upgradeable.append(item);
+            item["category"] = "upgradeable";
+            if (!report.legacy)
+                compatible.append(item);
+        }
+    }
+    return py::dict(
+        "total"_a = paths.size(),
+        "upgradeable"_a = upgradeable,
+        "rebuild_required"_a = rebuild_required,
+        "compatible"_a = compatible);
+}
+
 
 PYBIND11_PLUGIN(hnswlib) {
         py::module m("hnswlib");
+        m.attr("INDEX_FORMAT_VERSION") =
+            py::int_(hnswlib::INDEX_FORMAT_VERSION);
+        m.attr("INDEX_READER_VERSION") =
+            py::int_(hnswlib::INDEX_READER_VERSION);
+        m.attr("COMPAT_HEADER_SIZE") =
+            py::int_(hnswlib::INDEX_COMPAT_HEADER_SIZE);
+        m.attr("COMPAT_FOOTER_SIZE") =
+            py::int_(hnswlib::INDEX_COMPAT_FOOTER_SIZE);
+        m.attr("LEGACY_HEADER_SIZE") =
+            py::int_(hnswlib::legacyHeaderSize());
 
         py::class_<Index<float>>(m, "Index")
         .def(py::init(&Index<float>::createFromParams), py::arg("params"))
@@ -969,7 +1121,8 @@ PYBIND11_PLUGIN(hnswlib) {
             &Index<float>::loadIndex,
             py::arg("path_to_index"),
             py::arg("max_elements") = 0,
-            py::arg("allow_replace_deleted") = false)
+            py::arg("allow_replace_deleted") = false,
+            py::arg("check_compatibility") = true)
         .def("mark_deleted", &Index<float>::markDeleted, py::arg("label"))
         .def("unmark_deleted", &Index<float>::unmarkDeleted, py::arg("label"))
         .def("resize_index", &Index<float>::resizeIndex, py::arg("new_size"))
@@ -999,6 +1152,8 @@ PYBIND11_PLUGIN(hnswlib) {
         .def_property_readonly("M",  [](const Index<float> & index) {
           return index.index_inited ? index.appr_alg->M_ : 0;
         })
+        .def("get_compatibility_warnings",
+             &Index<float>::getCompatibilityWarnings)
 
         .def(py::pickle(
             [](const Index<float> &ind) {  // __getstate__
@@ -1034,5 +1189,20 @@ PYBIND11_PLUGIN(hnswlib) {
         .def("get_max_elements", &BFIndex<float>::getMaxElements)
         .def("get_current_count", &BFIndex<float>::getCurrentCount)
         .def_readwrite("num_threads", &BFIndex<float>::num_threads_default);
+
+        m.def("inspect_index_file", &inspectIndexFile,
+              py::arg("path_to_index"),
+              py::arg("space") = "",
+              py::arg("dim") = 0,
+              py::arg("M") = 0,
+              py::arg("ef_construction") = 0,
+              py::arg("reader_version") = 0);
+        m.def("scan_index_files", &scanIndexFiles,
+              py::arg("paths"),
+              py::arg("space") = "",
+              py::arg("dim") = 0,
+              py::arg("M") = 0,
+              py::arg("ef_construction") = 0,
+              py::arg("reader_version") = 0);
         return m.ptr();
 }

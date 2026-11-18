@@ -393,6 +393,10 @@ class InnerProductSpace : public SpaceInterface<float> {
         return &dim_;
     }
 
+    uint32_t get_space_id() const {
+        return INDEX_SPACE_IP;
+    }
+
 ~InnerProductSpace() {}
 };
 

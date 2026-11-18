@@ -12,6 +12,7 @@ Header-only C++ HNSW implementation with python bindings, insertions and updates
 * `StatusOr` stores T inline and moves the result; `*NoExceptions` stream writes return `Status` instead of throwing on write failure
 * Optional no-exceptions C++ API: `*NoExceptions` methods return `Status` / `StatusOr` so the headers can be compiled with `-fno-exceptions` (`-DHNSWLIB_ENABLE_EXCEPTIONS=OFF`). Throwing methods remain the default. (#619, #678) by [@michaelbautin](https://github.com/michaelbautin)
 * Stream `saveIndex` / `loadIndex` over `std::ostream` / `std::istream`, plus `getInternalIdByLabel`
+* Versioned index compatibility header/footer with fixed-size metadata inspection, parameter/truncation/byte-order checks, legacy-file adaptation, and batch scan output
 * CI covers exceptions on/off, Clang / GCC / MSVC, and ASAN / UBSAN
 * Fixed Clang UBSan misaligned label store in addPoint
 * Report addPoint capacity and stream write errors via Status
@@ -101,11 +102,57 @@ For other spaces use the nmslib library https://github.com/nmslib/nmslib.
     * `filter` filters elements by its labels, returns elements with allowed ids. Note that search with a filter works slow in python in multithreaded mode. It is recommended to set `num_threads=1`
     * Thread-safe with other `knn_query` calls, but not with `add_items`.
     
-* `load_index(path_to_index, max_elements = 0, allow_replace_deleted = False)` loads the index from persistence to the uninitialized index.
+* `load_index(path_to_index, max_elements = 0, allow_replace_deleted = False, check_compatibility = True)` loads the index from persistence to the uninitialized index.
     * `max_elements`(optional) resets the maximum number of elements in the structure.
     * `allow_replace_deleted` specifies whether the index being loaded has enabled replacing of deleted elements.
+    * `check_compatibility` is enabled by default. It rejects version, byte-order,
+      structural-layout, truncation, and parameter conflicts before the graph body
+      is loaded. Set it to `False` only for explicit emergency recovery.
       
 * `save_index(path_to_index)` saves the index from persistence.
+
+* `get_compatibility_warnings()` returns non-fatal warnings from the last load,
+  such as a cross-platform alignment-profile difference.
+
+Index compatibility can also be inspected without constructing or loading an
+index:
+
+```python
+info = hnswlib.inspect_index_file("index.bin", space="l2", dim=128)
+print(info["status"], info["reason"])
+
+batch = hnswlib.scan_index_files(
+    ["a.bin", "b.bin"], space="l2", dim=128
+)
+print("upgradeable:", batch["upgradeable"])
+print("rebuild required:", batch["rebuild_required"])
+```
+
+`inspect_index_file` reads only the fixed header and compatibility footer. For
+batch deployment tickets, use the JSON or CSV scanner:
+
+```bash
+python python_bindings/scan_indexes.py --recursive --format csv \
+    --space l2 --dim 128 /data/indexes > index-tickets.csv
+```
+
+Each scan row contains the file path, `upgradeable` or `rebuild_required`
+category, action, reason, format version, parameters, byte order, and warnings.
+
+Index format v1 is the historical native-POD layout and remains readable. New
+files are format v2: the legacy header and graph bytes are unchanged, while a
+fixed compatibility header follows the legacy header and a version footer is
+appended. Older readers reject v2 files at their existing file-size validation
+before allocating graph memory. New readers auto-adapt readable v1 files and
+report them as `upgradeable`; re-saving adds the full metadata. A v2 file whose
+`min_reader_version` is newer than the running reader is rejected explicitly.
+Legacy v1 files do not contain a space identifier, so the reader verifies the
+vector payload width and emits a warning that the distance space cannot be
+cross-checked.
+
+The format/reader versions can be selected at compile time with
+`HNSWLIB_INDEX_FORMAT_VERSION` and `HNSWLIB_INDEX_READER_VERSION`. The executable
+cross-version drill is `tests/run_index_version_drill.sh`.
 
 * `set_num_threads(num_threads)` set the default number of cpu threads used during data insertion/querying.
   

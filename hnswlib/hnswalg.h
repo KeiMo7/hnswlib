@@ -76,6 +76,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     std::mutex deleted_elements_lock;  // lock for deleted_elements
     std::unordered_set<tableint> deleted_elements;  // contains internal ids of deleted elements
 
+    uint32_t compatibility_space_id_{INDEX_SPACE_UNKNOWN};
+    std::vector<std::string> compatibility_warnings_;
+
 
     HierarchicalNSW(SpaceInterface<dist_t> *s) {
     }
@@ -86,9 +89,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         const std::string &location,
         bool nmslib = false,
         size_t max_elements = 0,
-        bool allow_replace_deleted = false)
+        bool allow_replace_deleted = false,
+        bool check_compatibility = true)
         : allow_replace_deleted_(allow_replace_deleted) {
-        loadIndex(location, s, max_elements);
+        loadIndex(location, s, max_elements, check_compatibility);
     }
 
 
@@ -106,6 +110,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         max_elements_ = max_elements;
         num_deleted_ = 0;
         data_size_ = s->get_data_size();
+        compatibility_space_id_ = s->get_space_id();
         fstdistfunc_ = s->get_dist_func();
         dist_func_param_ = s->get_dist_func_param();
         if ( M <= 10000 ) {
@@ -151,6 +156,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
         mult_ = 1 / log(1.0 * M_);
         revSize_ = 1.0 / mult_;
+    }
+
+    void setCompatibilitySpaceId(uint32_t space_id) {
+        compatibility_space_id_ = space_id;
+    }
+
+    const std::vector<std::string> &getCompatibilityWarnings() const {
+        return compatibility_warnings_;
     }
 
 
@@ -694,31 +707,100 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         return OkStatus();
     }
 
-    size_t indexFileSize() const {
-        size_t size = 0;
-        size += sizeof(offsetLevel0_);
-        size += sizeof(max_elements_);
-        size += sizeof(cur_element_count);
-        size += sizeof(size_data_per_element_);
-        size += sizeof(label_offset_);
-        size += sizeof(offsetData_);
-        size += sizeof(maxlevel_);
-        size += sizeof(enterpoint_node_);
-        size += sizeof(maxM_);
-
-        size += sizeof(maxM0_);
-        size += sizeof(M_);
-        size += sizeof(mult_);
-        size += sizeof(ef_construction_);
-
-        size += cur_element_count * size_data_per_element_;
-
+    size_t bodySize() const {
+        size_t size = cur_element_count * size_data_per_element_;
         for (size_t i = 0; i < cur_element_count; i++) {
-            unsigned int linkListSize = element_levels_[i] > 0 ? size_links_per_element_ * element_levels_[i] : 0;
+            unsigned int linkListSize =
+                element_levels_[i] > 0
+                    ? size_links_per_element_ * element_levels_[i]
+                    : 0;
             size += sizeof(linkListSize);
             size += linkListSize;
         }
         return size;
+    }
+
+    size_t indexFileSize() const {
+        size_t size = legacyHeaderSize() + bodySize();
+        if (INDEX_FORMAT_VERSION >= 2)
+            size += INDEX_COMPAT_HEADER_SIZE + INDEX_COMPAT_FOOTER_SIZE;
+        return size;
+    }
+
+    IndexFormatMetadata makeCompatibilityMetadata(uint64_t header_offset) const {
+        IndexFormatMetadata metadata;
+        metadata.present = true;
+        metadata.metadata_version = INDEX_COMPAT_METADATA_VERSION;
+        metadata.format_version = INDEX_FORMAT_VERSION;
+        metadata.min_reader_version = INDEX_FORMAT_VERSION;
+        metadata.flags = 0;
+        metadata.body_byte_order = hostByteOrder();
+        metadata.size_t_size = static_cast<uint32_t>(sizeof(size_t));
+        metadata.pointer_size = static_cast<uint32_t>(sizeof(void *));
+        metadata.max_align =
+            static_cast<uint32_t>(alignof(std::max_align_t));
+        metadata.space_id = compatibility_space_id_;
+        metadata.distance_type_size = static_cast<uint32_t>(sizeof(dist_t));
+        if (metadata.distance_type_size != 0 &&
+            (data_size_ % metadata.distance_type_size) == 0) {
+            metadata.dim = static_cast<uint32_t>(
+                data_size_ / metadata.distance_type_size);
+        }
+        metadata.max_elements = static_cast<uint64_t>(max_elements_);
+        metadata.element_count =
+            static_cast<uint64_t>(cur_element_count.load());
+        metadata.graph_m = static_cast<uint64_t>(M_);
+        metadata.ef_construction = static_cast<uint64_t>(ef_construction_);
+        metadata.header_offset = header_offset;
+        metadata.header_size = INDEX_COMPAT_HEADER_SIZE;
+        metadata.body_size = static_cast<uint64_t>(bodySize());
+        metadata.file_size = header_offset + INDEX_COMPAT_HEADER_SIZE +
+                             metadata.body_size + INDEX_COMPAT_FOOTER_SIZE;
+        metadata.size_data_per_element =
+            static_cast<uint64_t>(size_data_per_element_);
+        metadata.offset_data = static_cast<uint64_t>(offsetData_);
+        metadata.label_offset = static_cast<uint64_t>(label_offset_);
+        metadata.data_size = static_cast<uint64_t>(data_size_);
+
+        uint64_t alignment = 1;
+        while (alignment < 64) {
+            const uint64_t next = alignment * 2;
+            if ((offsetData_ % next) != 0 ||
+                (size_data_per_element_ % next) != 0 ||
+                (size_links_level0_ % next) != 0)
+                break;
+            alignment = next;
+        }
+        metadata.data_alignment = alignment;
+        return metadata;
+    }
+
+    Status writeCompatibilityHeader(std::ostream &output) {
+        const IndexFormatMetadata metadata =
+            makeCompatibilityMetadata(static_cast<uint64_t>(legacyHeaderSize()));
+        const std::vector<unsigned char> payload =
+            encodeMetadata(metadata);
+        output.write(INDEX_COMPAT_HEADER_MAGIC,
+                     sizeof(INDEX_COMPAT_HEADER_MAGIC));
+        output.write(reinterpret_cast<const char *>(payload.data()),
+                     static_cast<std::streamsize>(payload.size()));
+        if (!output.good())
+            return Status("Failed writing index compatibility header");
+        return OkStatus();
+    }
+
+    Status writeCompatibilityFooter(std::ostream &output) {
+        const IndexFormatMetadata metadata =
+            makeCompatibilityMetadata(static_cast<uint64_t>(legacyHeaderSize()));
+        const std::vector<unsigned char> payload =
+            encodeMetadata(metadata);
+        output.write(INDEX_COMPAT_FOOTER_MAGIC,
+                     sizeof(INDEX_COMPAT_FOOTER_MAGIC));
+        output.write(reinterpret_cast<const char *>(payload.data()),
+                     static_cast<std::streamsize>(payload.size()));
+        if (!output.good())
+            return Status("Failed writing index compatibility footer");
+        return OkStatus();
     }
 
     Status saveIndexNoExceptions(std::ostream &output) {
@@ -746,6 +828,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
               return Status("Failed writing index metadata");
             }
 
+            if (INDEX_FORMAT_VERSION >= 2) {
+                Status status = writeCompatibilityHeader(output);
+                if (!status.ok())
+                    return status;
+            }
+
             output.write(data_level0_memory_, cur_element_count * size_data_per_element_);
             if (!output.good()) {
               return Status("Failed writing level 0 memory block");
@@ -760,6 +848,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 if (!output.good()) {
                     return Status("Failed writing link list elements");
                 }
+            }
+            if (INDEX_FORMAT_VERSION >= 2) {
+                Status status = writeCompatibilityFooter(output);
+                if (!status.ok())
+                    return status;
             }
             return OkStatus();
         });
@@ -780,7 +873,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
     }
 
-    Status loadIndexNoExceptions(std::istream &input, SpaceInterface<dist_t> *s, size_t max_elements_i = 0) {
+    Status loadIndexNoExceptions(std::istream &input, SpaceInterface<dist_t> *s,
+                                 size_t max_elements_i = 0,
+                                 bool check_compatibility = true) {
         // Must not destroy the live index until the stream is known to be readable.
         // An unopened / failed stream used to seek to -1, skip the empty-index
         // corruption loop, and return OkStatus() after clear().
@@ -805,15 +900,188 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             return Status("Cannot load index: failed to determine stream size");
         }
 
-        clear();
+        const uint64_t file_size =
+            static_cast<uint64_t>(total_filesize);
+        const IndexEnvelope envelope =
+            readIndexEnvelope(input, file_size);
+        const bool has_metadata =
+            envelope.has_header || envelope.has_footer;
+        uint64_t body_offset = static_cast<uint64_t>(legacyHeaderSize());
+        uint64_t expected_body_end = file_size;
 
+        if (has_metadata) {
+            if ((envelope.has_footer && !envelope.has_header) ||
+                !envelope.error.empty()) {
+                return Status(envelope.error.empty()
+                                  ? "Index compatibility metadata is incomplete"
+                                  : envelope.error);
+            }
+
+            const IndexFormatMetadata &metadata = envelope.metadata;
+            if (metadata.body_byte_order != hostByteOrder()) {
+                std::ostringstream message;
+                message << "Index body byte order is "
+                        << byteOrderName(metadata.body_byte_order)
+                        << " but this platform is "
+                        << byteOrderName(hostByteOrder())
+                        << "; refusing to load because byte swapping is not "
+                           "supported";
+                return Status(message.str());
+            }
+            if (metadata.size_t_size != sizeof(size_t) ||
+                metadata.pointer_size != sizeof(void *)) {
+                std::ostringstream message;
+                message << "Index layout was written with size_t="
+                        << metadata.size_t_size << ", pointer="
+                        << metadata.pointer_size
+                        << " but this reader uses size_t=" << sizeof(size_t)
+                        << ", pointer=" << sizeof(void *)
+                        << "; refusing to load";
+                return Status(message.str());
+            }
+            if (metadata.header_offset >
+                    std::numeric_limits<uint64_t>::max() -
+                        metadata.header_size) {
+                return Status("Index compatibility header size overflows");
+            }
+            body_offset = metadata.header_offset + metadata.header_size;
+            if (body_offset >
+                    std::numeric_limits<uint64_t>::max() -
+                        metadata.body_size) {
+                return Status("Index body size overflows");
+            }
+            expected_body_end = body_offset + metadata.body_size;
+            uint64_t expected_file_end = expected_body_end;
+            if (envelope.has_footer) {
+                if (expected_file_end >
+                    std::numeric_limits<uint64_t>::max() -
+                        INDEX_COMPAT_FOOTER_SIZE) {
+                    return Status("Index footer size overflows");
+                }
+                expected_file_end += INDEX_COMPAT_FOOTER_SIZE;
+            }
+            if (file_size != expected_file_end ||
+                (envelope.has_footer &&
+                 metadata.file_size != expected_file_end)) {
+                std::ostringstream message;
+                message << "Index file is "
+                        << (file_size < expected_file_end ? "truncated"
+                                                          : "malformed")
+                        << ": metadata declares " << expected_file_end
+                        << " bytes but file has " << file_size;
+                return Status(message.str());
+            }
+
+            if (check_compatibility) {
+                if (!envelope.has_footer) {
+                    return Status(
+                        "Index compatibility footer is missing; file is "
+                        "truncated or was not written completely");
+                }
+                if (metadata.min_reader_version > INDEX_READER_VERSION) {
+                    std::ostringstream message;
+                    message << "Index format v" << metadata.format_version
+                            << " requires reader v"
+                            << metadata.min_reader_version
+                            << ", current reader is v"
+                            << INDEX_READER_VERSION
+                            << "; refusing to load (upgrade the reader or "
+                               "rebuild the index)";
+                    return Status(message.str());
+                }
+                if (metadata.data_size != 0 &&
+                    metadata.data_size != s->get_data_size()) {
+                    std::ostringstream message;
+                    message << "Index parameter conflict: file vector payload "
+                            << "size is " << metadata.data_size
+                            << " bytes but loader expects "
+                            << s->get_data_size() << " bytes";
+                    return Status(message.str());
+                }
+                const uint32_t reader_space_id = s->get_space_id();
+                if (metadata.space_id != INDEX_SPACE_UNKNOWN &&
+                    reader_space_id != INDEX_SPACE_UNKNOWN) {
+                    const bool cosine_compatible =
+                        metadata.space_id == INDEX_SPACE_COSINE &&
+                        reader_space_id == INDEX_SPACE_IP;
+                    if (metadata.space_id != reader_space_id &&
+                        !cosine_compatible) {
+                        std::ostringstream message;
+                        message << "Index parameter conflict: file space '"
+                                << spaceName(metadata.space_id)
+                                << "' does not match loader space '"
+                                << spaceName(reader_space_id) << "'";
+                        return Status(message.str());
+                    }
+                }
+            }
+        } else {
+            LegacyIndexHeader legacy_header;
+            std::string legacy_error;
+            if (!readLegacyHeader(input, &legacy_header, &legacy_error))
+                return Status(legacy_error);
+            if (legacy_header.offset_level0 != 0 ||
+                legacy_header.max_elements < legacy_header.element_count ||
+                legacy_header.graph_m == 0 ||
+                legacy_header.max_m0 != legacy_header.graph_m * 2) {
+                return Status("Index file is not a recognized legacy "
+                              "hnswlib index");
+            }
+            const uint64_t legacy_links_size =
+                static_cast<uint64_t>(legacy_header.max_m0) *
+                    sizeof(tableint) +
+                sizeof(linklistsizeint);
+            if (legacy_header.size_data_per_element <=
+                legacy_links_size + sizeof(labeltype)) {
+                return Status("Cannot load index: invalid legacy element "
+                              "layout");
+            }
+            const uint64_t legacy_data_size =
+                legacy_header.size_data_per_element - legacy_links_size -
+                sizeof(labeltype);
+            if (check_compatibility &&
+                legacy_data_size != s->get_data_size()) {
+                std::ostringstream message;
+                message << "Index parameter conflict: file vector payload "
+                        << "size is " << legacy_data_size
+                        << " bytes but loader expects "
+                        << s->get_data_size() << " bytes";
+                return Status(message.str());
+            }
+            uint64_t minimum_size = 0;
+            if (!legacyMinimumSize(legacy_header, &minimum_size) ||
+                file_size < minimum_size) {
+                std::ostringstream message;
+                message << "Index file is truncated: declared layout needs "
+                        << minimum_size << " bytes but file has "
+                        << file_size;
+                return Status(message.str());
+            }
+        }
+
+        clear();
+        compatibility_warnings_.clear();
+        compatibility_space_id_ = s->get_space_id();
+        if (has_metadata)
+            addAlignmentWarning(envelope.metadata, &compatibility_warnings_);
+        for (size_t i = 0; i < compatibility_warnings_.size(); ++i) {
+            HNSWERR << "hnswlib compatibility warning: "
+                    << compatibility_warnings_[i] << std::endl;
+        }
+
+        input.clear();
+        input.seekg(0, input.beg);
         readBinaryPOD(input, offsetLevel0_);
         readBinaryPOD(input, max_elements_);
         readBinaryPOD(input, cur_element_count);
 
+        const size_t stored_max_elements = max_elements_;
         size_t max_elements = max_elements_i;
         if (max_elements < cur_element_count)
             max_elements = max_elements_;
+        if (max_elements < cur_element_count)
+            return Status("Cannot load index: max_elements is smaller than "
+                          "the number of stored elements");
         max_elements_ = max_elements;
         readBinaryPOD(input, size_data_per_element_);
         readBinaryPOD(input, label_offset_);
@@ -830,28 +1098,87 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             return Status("Cannot load index: failed to read index header");
         }
 
+        if (has_metadata) {
+            const IndexFormatMetadata &metadata = envelope.metadata;
+            if (metadata.max_elements != stored_max_elements ||
+                metadata.element_count != cur_element_count ||
+                metadata.size_data_per_element !=
+                    size_data_per_element_ ||
+                metadata.offset_data != offsetData_ ||
+                metadata.label_offset != label_offset_ ||
+                metadata.graph_m != M_ ||
+                metadata.ef_construction != ef_construction_) {
+                return Status("Index compatibility metadata does not match "
+                              "the historical index header");
+            }
+        }
+
         data_size_ = s->get_data_size();
         fstdistfunc_ = s->get_dist_func();
         dist_func_param_ = s->get_dist_func_param();
 
-        auto pos = input.tellg();
+        const auto pos =
+            static_cast<std::streamoff>(has_metadata ? body_offset
+                                                     : legacyHeaderSize());
+        if (!has_metadata && check_compatibility) {
+            const uint64_t links_size =
+                static_cast<uint64_t>(maxM0_) * sizeof(tableint) +
+                sizeof(linklistsizeint);
+            if (size_data_per_element_ <= links_size + sizeof(labeltype))
+                return Status("Cannot load index: invalid element layout");
+            const uint64_t file_data_size =
+                size_data_per_element_ - links_size - sizeof(labeltype);
+            if (file_data_size != data_size_) {
+                std::ostringstream message;
+                message << "Index parameter conflict: file vector payload "
+                        << "size is " << file_data_size
+                        << " bytes but loader expects " << data_size_
+                        << " bytes";
+                return Status(message.str());
+            }
+        }
+        if (max_elements != 0 &&
+            size_data_per_element_ >
+                std::numeric_limits<size_t>::max() / max_elements) {
+            return Status("Cannot load index: element layout size overflows");
+        }
 
         /// Optional - check if index is ok:
+        input.clear();
+        input.seekg(pos, input.beg);
+        if (input.tellg() < 0 ||
+            static_cast<uint64_t>(input.tellg()) > expected_body_end) {
+            return Status("Index body offset is outside the file");
+        }
         input.seekg(cur_element_count * size_data_per_element_, input.cur);
         for (size_t i = 0; i < cur_element_count; i++) {
-            if (input.tellg() < 0 || input.tellg() >= total_filesize) {
+            if (input.tellg() < 0 ||
+                static_cast<uint64_t>(input.tellg()) >= expected_body_end) {
                 return Status("Index seems to be corrupted or unsupported");
             }
 
             unsigned int linkListSize;
             readBinaryPOD(input, linkListSize);
+            if (!input)
+                return Status("Index file is truncated while reading link "
+                              "list metadata");
             if (linkListSize != 0) {
+                const std::streamoff current = input.tellg();
+                if (current < 0 ||
+                    static_cast<uint64_t>(current) > expected_body_end ||
+                    static_cast<uint64_t>(linkListSize) >
+                        expected_body_end -
+                            static_cast<uint64_t>(current)) {
+                    return Status("Index file is truncated while reading a "
+                                  "link list");
+                }
                 input.seekg(linkListSize, input.cur);
             }
         }
 
         // throw exception if it either corrupted or old index
-        if (input.tellg() != total_filesize)
+        if (input.tellg() < 0 ||
+            static_cast<uint64_t>(input.tellg()) != expected_body_end)
             return Status("Index seems to be corrupted or unsupported");
 
         input.clear();
@@ -863,6 +1190,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         if (data_level0_memory_ == nullptr)
             return Status("Not enough memory: loadIndex failed to allocate level0");
         input.read(data_level0_memory_, cur_element_count * size_data_per_element_);
+        if (!input) {
+            return Status("Index file is truncated while reading level 0");
+        }
 
         size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
 
@@ -886,11 +1216,16 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 element_levels_[i] = 0;
                 linkLists_[i] = nullptr;
             } else {
+                if (linkListSize % size_links_per_element_ != 0)
+                    return Status("Index link list has an invalid size");
                 element_levels_[i] = linkListSize / size_links_per_element_;
                 linkLists_[i] = (char *) malloc(linkListSize);
                 if (linkLists_[i] == nullptr)
                     return Status("Not enough memory: loadIndex failed to allocate linklist");
                 input.read(linkLists_[i], linkListSize);
+                if (!input)
+                    return Status("Index file is truncated while reading a "
+                                  "link list");
             }
         }
 
@@ -907,13 +1242,16 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
 
 
-    void loadIndex(const std::string &location, SpaceInterface<dist_t> *s, size_t max_elements_i = 0) {
+    void loadIndex(const std::string &location, SpaceInterface<dist_t> *s,
+                   size_t max_elements_i = 0,
+                   bool check_compatibility = true) {
         std::ifstream input(location, std::ios::binary);
 
         if (!input.is_open())
             HNSWLIB_THROW_RUNTIME_ERROR("Cannot open file");
 
-        Status status = loadIndexNoExceptions(input, s, max_elements_i);
+        Status status = loadIndexNoExceptions(input, s, max_elements_i,
+                                              check_compatibility);
         if (!status.ok()) {
             HNSWLIB_THROW_RUNTIME_ERROR(status.message());
         }

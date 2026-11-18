@@ -13,6 +13,7 @@ set(HNSWLIB_TARGETS_REQUIRING_EXCEPTIONS
     example_mt_filter
     example_mt_replace_deleted
     example_mt_search
+    index_compat_test
     multiThread_replace_test
     test_updates)
 
@@ -29,6 +30,7 @@ set(EXAMPLE_NAMES
 
 set(TEST_NAMES
     epsilon_search_test
+    index_compat_test
     multiThread_replace_test
     multiThreadLoad_test
     multivector_search_test

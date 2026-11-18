@@ -249,6 +249,10 @@ class L2Space : public SpaceInterface<float> {
         return &dim_;
     }
 
+    uint32_t get_space_id() const {
+        return INDEX_SPACE_L2;
+    }
+
     ~L2Space() {}
 };
 
@@ -317,6 +321,10 @@ class L2SpaceI : public SpaceInterface<int> {
 
     void *get_dist_func_param() {
         return &dim_;
+    }
+
+    uint32_t get_space_id() const {
+        return INDEX_SPACE_L2;
     }
 
     ~L2SpaceI() {}
